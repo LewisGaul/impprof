@@ -3,6 +3,7 @@
 __all__ = ("Import", "Monitor")
 
 import argparse
+import contextlib
 import dataclasses
 import importlib
 import importlib.abc
@@ -271,16 +272,17 @@ def main(argv: Optional[List[str]] = None) -> Monitor:
     setup_logging()
 
     with Monitor() as monitor:
-        if args.module:
-            with mock.patch("sys.argv", args.module):
-                runpy.run_module(sys.argv[0], run_name="__main__")
-        elif args.file:
-            with mock.patch("sys.argv", args.file):
-                runpy.run_path(sys.argv[0], run_name="__main__")
-        elif args.imp:
-            importlib.import_module(args.imp)
-        else:
-            assert False
+        with contextlib.suppress(SystemExit):
+            if args.module:
+                with mock.patch("sys.argv", args.module):
+                    runpy.run_module(sys.argv[0], run_name="__main__")
+            elif args.file:
+                with mock.patch("sys.argv", args.file):
+                    runpy.run_path(sys.argv[0], run_name="__main__")
+            elif args.imp:
+                importlib.import_module(args.imp)
+            else:
+                assert False
 
     return monitor
 
