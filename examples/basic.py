@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import importlib
 import logging
 import sys
 
@@ -10,7 +11,7 @@ logging.basicConfig(format="%(asctime)s [%(levelname)s:%(name)s] - %(message)s")
 logging.getLogger("impprof").setLevel(logging.DEBUG)
 
 with impprof.Monitor() as mon:
-    __import__(sys.argv[1])
+    importlib.import_module(sys.argv[1])
 
 for i in mon.imports.values():
     print(i)
