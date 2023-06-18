@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations
-
-
 __all__ = ("Import", "Monitor")
 
 import argparse
@@ -21,7 +18,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 from importlib.machinery import ModuleSpec
 from types import ModuleType
-from typing import Container, Optional, Tuple, Dict
+from typing import Container, List, Optional, Tuple, Dict
 from unittest import mock
 
 
@@ -36,7 +33,7 @@ _sys_modules_actual = sys.modules
 _ImportLoc = namedtuple("_ImportLoc", "package, lineno")
 
 
-def _get_import_position() -> _ImportLoc | None:
+def _get_import_position() -> Optional[_ImportLoc]:
     """
     Try to get the module and line number of the frame triggering an import.
 
@@ -65,7 +62,7 @@ class Import:
     start_time: Optional[float] = None
     end_time: Optional[float] = None
     # Mapping with keys being the line number of the import.
-    direct_imports: Dict[Tuple[str, int], Import] = dataclasses.field(
+    direct_imports: Dict[Tuple[str, int], "Import"] = dataclasses.field(
         default_factory=dict
     )
 
@@ -104,7 +101,7 @@ class TimingLoader(importlib.abc.Loader):
     def __init__(
         self,
         orig_loader: importlib.abc.Loader,
-        imports: dict[str, Import],
+        imports: Dict[str, Import],
         mod_name: str,
         logger: logging.Logger,
     ):
@@ -112,16 +109,16 @@ class TimingLoader(importlib.abc.Loader):
         self._imports = imports
         self._mod_name = mod_name
         self._logger = logger
-
-    def create_module(self, spec: ModuleSpec) -> ModuleType | None:
-        return self._orig_loader.create_module(spec)
+        for method in ["create_module", "get_code"]:
+            if hasattr(self._orig_loader, method):
+                setattr(self, method, getattr(self._orig_loader, method))
 
     def exec_module(self, module: ModuleType) -> None:
-
         # Get or create the import object.
-        assert (
-            self._mod_name not in self._imports
-        ), f"Unexpectedly found {self._mod_name!r} already in imports"
+        if self._mod_name in self._imports:
+            self._logger.warning(
+                "Unexpectedly found %r already in imports", self._mod_name
+            )
         import_obj = Import(self._mod_name)
         self._imports[self._mod_name] = import_obj
 
@@ -163,7 +160,7 @@ class TimingLoader(importlib.abc.Loader):
 class TimingFinder(importlib.abc.MetaPathFinder):
     def __init__(
         self,
-        imports: dict[str, Import],
+        imports: Dict[str, Import],
         logger: logging.Logger,
         ignore: Container[str] = (),
     ):
@@ -186,7 +183,7 @@ class TimingFinder(importlib.abc.MetaPathFinder):
             [x for x in sys.meta_path if type(x) is not TimingFinder],
         ):
             spec = importlib.util.find_spec(fullname)
-        if spec:
+        if spec and hasattr(spec.loader, "exec_module"):
             spec.loader = TimingLoader(
                 spec.loader, self._imports, fullname, self._logger
             )
@@ -206,7 +203,7 @@ class Monitor:
         self.imports: dict[str, Import] = {}
         self._logger = logger.getChild(f"Monitor-{self._id}")
 
-    def __enter__(self) -> Monitor:
+    def __enter__(self) -> "Monitor":
         self.start()
         return self
 
@@ -257,7 +254,7 @@ def setup_logging() -> None:
     # logger.addHandler(fh)
 
 
-def parse_args(argv: list[str] | None = None):
+def parse_args(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser("impprof", allow_abbrev=False)
     group = parser.add_mutually_exclusive_group()
     group.required = True
@@ -269,7 +266,7 @@ def parse_args(argv: list[str] | None = None):
     return parser.parse_args(argv)
 
 
-def main(argv: list[str] | None = None):
+def main(argv: Optional[List[str]] = None) -> Monitor:
     args = parse_args(argv)
     setup_logging()
 
@@ -285,6 +282,8 @@ def main(argv: list[str] | None = None):
         else:
             assert False
 
+    return monitor
+
 
 if __name__ == "__main__":
-    main()
+    monitor = main()
