@@ -10,4 +10,4 @@ def test_pkg1():
         import pkg1
 
     imps = monitor.imports
-    assert set(imps.keys()).intersection({"pkg1", "argparse", "collections"})
+    assert set(imps.keys()).intersection({"pkg1", "mimetypes"})

@@ -1,4 +1,5 @@
 import argparse
+import mimetypes
 from collections import abc
 from types import SimpleNamespace
 

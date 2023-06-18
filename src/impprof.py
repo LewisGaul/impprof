@@ -8,16 +8,20 @@ __all__ = ("Import", "Monitor")
 import argparse
 import dataclasses
 import importlib
+import importlib.abc
+import importlib.util
 import inspect
 import logging
 import runpy
 import sys
 import textwrap
 import time
+import traceback
 from collections import namedtuple
 from dataclasses import dataclass
+from importlib.machinery import ModuleSpec
 from types import ModuleType
-from typing import Any, Container, Iterable, Mapping, Optional
+from typing import Container, Optional, Tuple, Dict
 from unittest import mock
 
 
@@ -26,22 +30,49 @@ LOG_FILE = f".impprof.{int(time.time())}.log"
 logger = logging.getLogger("impprof")
 
 _import_actual = __import__
-
 _sys_modules_actual = sys.modules
+
+
+_ImportLoc = namedtuple("_ImportLoc", "package, lineno")
+
+
+def _get_import_position() -> _ImportLoc | None:
+    """
+    Try to get the module and line number of the frame triggering an import.
+
+    :return:
+        Module name and line number, if available, otherwise None.
+    """
+    frame = inspect.currentframe().f_back.f_back
+    while frame:
+        frame_info = inspect.getframeinfo(frame)
+        frame_module = frame.f_globals["__name__"]
+        # print(f"{frame_module}:{frame_info.lineno}")
+        if frame_module.startswith("importlib"):
+            frame = frame.f_back
+        elif frame_module == "impprof":
+            return None
+        else:
+            return _ImportLoc(frame_module, frame_info.lineno)
+    return None
 
 
 @dataclass
 class Import:
+    """Representation of a single import."""
+
     module: str
-    start_time: float
+    start_time: Optional[float] = None
     end_time: Optional[float] = None
     # Mapping with keys being the line number of the import.
-    direct_imports: dict[int, Import] = dataclasses.field(default_factory=dict)
+    direct_imports: Dict[Tuple[str, int], Import] = dataclasses.field(
+        default_factory=dict
+    )
 
     def __str__(self):
         if self.direct_imports:
             direct_imports_str = "\n" + "\n".join(
-                f"    line {i}: {x.module}" for i, x in self.direct_imports.items()
+                f"    line {i[1]}: {x.module}" for i, x in self.direct_imports.items()
             )
         else:
             direct_imports_str = "   <none>"
@@ -49,7 +80,7 @@ class Import:
             f"""\
             Import: {self.module}
               elapsed:   {self.elapsed_ms} ms
-              accounted: {self.elapsed_ms} ms
+              accounted: {self.accounted_ms} ms
               imports:{{}}
             """
         ).format(direct_imports_str)
@@ -64,22 +95,115 @@ class Import:
     def accounted_ms(self) -> Optional[int]:
         if self.end_time is None:
             return None
-        return self.elapsed_ms - sum(x.elapsed_ms for x in self.direct_imports.values())
+        return self.elapsed_ms - sum(
+            x.elapsed_ms for x in self.direct_imports.values() if x.end_time
+        )
+
+
+class TimingLoader(importlib.abc.Loader):
+    def __init__(
+        self,
+        orig_loader: importlib.abc.Loader,
+        imports: dict[str, Import],
+        mod_name: str,
+        logger: logging.Logger,
+    ):
+        self._orig_loader = orig_loader
+        self._imports = imports
+        self._mod_name = mod_name
+        self._logger = logger
+
+    def create_module(self, spec: ModuleSpec) -> ModuleType | None:
+        return self._orig_loader.create_module(spec)
+
+    def exec_module(self, module: ModuleType) -> None:
+
+        # Get or create the import object.
+        assert (
+            self._mod_name not in self._imports
+        ), f"Unexpectedly found {self._mod_name!r} already in imports"
+        import_obj = Import(self._mod_name)
+        self._imports[self._mod_name] = import_obj
+
+        # Add to the parent's 'direct_imports'.
+        imp_loc = _get_import_position()
+        if not imp_loc:
+            incomplete_imports = [
+                x.module
+                for x in self._imports.values()
+                if not x.end_time and x.module != self._mod_name
+            ]
+            if incomplete_imports:
+                self._logger.warning(
+                    "Unable to get parent module from stack, assigning to latest partial import %r",
+                    incomplete_imports[-1],
+                )
+                imp_loc = _ImportLoc(incomplete_imports[-1], 0)
+        if imp_loc and imp_loc.package in self._imports and imp_loc.lineno:
+            self._imports[imp_loc.package].direct_imports[
+                (self._mod_name, imp_loc.lineno)
+            ] = import_obj
+        elif imp_loc:
+            self._logger.warning(
+                "Unable to add %s to parent module %s", self._mod_name, imp_loc.package
+            )
+            # traceback.print_stack()
+        else:
+            self._logger.warning("Unable to find parent module for %s", self._mod_name)
+            # traceback.print_stack()
+
+        imp_loc_str = f"{imp_loc.package}:{imp_loc.lineno}" if imp_loc else "<none>"
+        self._logger.debug("Executing module '%s' (%s)", self._mod_name, imp_loc_str)
+        import_obj.start_time = time.time()
+        self._orig_loader.exec_module(module)
+        import_obj.end_time = time.time()
+        self._logger.debug("Finished executing module '%s'", self._mod_name)
+
+
+class TimingFinder(importlib.abc.MetaPathFinder):
+    def __init__(
+        self,
+        imports: dict[str, Import],
+        logger: logging.Logger,
+        ignore: Container[str] = (),
+    ):
+        self._imports = imports
+        self._logger = logger
+        self._ignore_pkgs = ignore
+        # if "importlib" not in self._ignore_pkgs:
+        #     self._ignore_pkgs = set(self._ignore_pkgs) | {"importlib"}
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Optional[str] = None,
+        target: Optional[ModuleType] = None,
+    ) -> Optional[ModuleSpec]:
+        if any(fullname.partition(".")[0] == p for p in self._ignore_pkgs):
+            return None
+        with mock.patch(
+            "sys.meta_path",
+            [x for x in sys.meta_path if type(x) is not TimingFinder],
+        ):
+            spec = importlib.util.find_spec(fullname)
+        if spec:
+            spec.loader = TimingLoader(
+                spec.loader, self._imports, fullname, self._logger
+            )
+        return spec
 
 
 class Monitor:
+    """Monitor used for tracking imports."""
 
     _active: bool = False
     _count: int = 0
 
-    _CallerInfo = namedtuple("_CallerInfo", "pkg, lineno")
-
-    def __init__(self, ignore: Container[str] = ("sys", "_io")):
+    def __init__(self, ignore: Container[str] = ("sys", "_io", "os")):
         self._id = self.__class__._count
         self.__class__._count += 1
         self._ignore_pkgs = ignore
         self.imports: dict[str, Import] = {}
-        self._import_patch = mock.patch("builtins.__import__", self._import_mock)
         self._logger = logger.getChild(f"Monitor-{self._id}")
 
     def __enter__(self) -> Monitor:
@@ -95,121 +219,15 @@ class Monitor:
             raise RuntimeError("Unable to start import monitor - already started")
         self.__class__._active = True
         self._logger.debug("Starting import monitoring")
-        self._import_patch.start()
+        sys.meta_path.insert(
+            0, TimingFinder(self.imports, self._logger, self._ignore_pkgs)
+        )
 
     def stop(self) -> None:
-        self._import_patch.stop()
+        finder = sys.meta_path.pop(0)
+        assert type(finder) == TimingFinder
         self.__class__._active = False
         self._logger.debug("Stopped import monitoring")
-
-    @classmethod
-    def _get_calling_module(cls) -> _CallerInfo | None:
-        """
-        Try to get the module and line number of the calling frame.
-
-        :return:
-            Module name and line number, if available, otherwise None.
-        """
-        try:
-            calling_frame = inspect.currentframe().f_back.f_back
-            frame_info = inspect.getframeinfo(calling_frame)
-            frame_module = calling_frame.f_globals["__name__"]
-            if frame_module.startswith("importlib._bootstrap"):
-                # TODO: What is this case?
-                return None
-            return cls._CallerInfo(frame_module, frame_info.lineno)
-        except Exception:
-            # TODO: Catch more specific case(s) (only one frame?)
-            return None
-
-    def _import_mock(
-        self,
-        name: str,
-        globals: Mapping[str, Any] = None,
-        locals: None = None,
-        fromlist: Iterable[str] = (),
-        level: int = 0,
-    ) -> ModuleType:
-        """
-        Replacement for the builtin 'import' (builtins.__import__).
-
-        Implements the required monitoring before forwarding to the real import
-        implementation.
-
-        See https://docs.python.org/3/library/functions.html#import__.
-
-        When importing a module from a package, note that __import__('A.B', ...)
-        returns package A when fromlist is empty, but its submodule B when
-        fromlist is not empty.
-
-        :param name:
-            The name of the import.
-        :param globals:
-            Used to determine the context, not modified.
-        :param locals:
-            Ignored.
-        :param fromlist:
-            A list of names to emulate 'from <name> import ...', or empty to
-            emulate 'import <name>'.
-        :param level:
-            Used to determine whether to perform absolute or relative imports:
-            0 is absolute, while a positive number is the number of parent
-            directories to search relative to the current module.
-        :return:
-            The imported module.
-        """
-        if any(name == p or name.startswith(f"{p}.") for p in self._ignore_pkgs):
-            return _import_actual(name, globals, locals, fromlist, level)
-
-        cached = name in sys.modules
-
-        caller = self._get_calling_module()
-        caller_str = f"{caller.pkg}:{caller.lineno}" if caller else "<none>"
-
-        if level == 0:
-            import_mod = name
-            full_import_mod = name
-        else:
-            # Add the parent package path to create the full module name.
-            import_mod = f".{name}"
-            assert caller is not None
-            full_import_mod = f"{caller.pkg}{import_mod}"
-        if fromlist:
-            self._logger.debug(
-                "Handling %s 'from %s import %s' (cached=%s, level=%d)",
-                caller_str,
-                import_mod,
-                ", ".join(fromlist),
-                cached,
-                level,
-            )
-        else:
-            self._logger.debug(
-                "Handling %s 'import %s' (cached=%s, level=%d)",
-                caller_str,
-                import_mod,
-                cached,
-                level,
-            )
-        start = time.time()
-        try:
-            imp_obj = self.imports[full_import_mod]
-        except KeyError:
-            imp_obj = Import(full_import_mod, start)
-            self.imports[full_import_mod] = imp_obj
-        if caller and caller.pkg in self.imports:
-            self.imports[caller.pkg].direct_imports[caller.lineno] = imp_obj
-        elif caller:
-            self._logger.warning(
-                "Unable to add %s to parent module %s", import_mod, caller_str
-            )
-        try:
-            return _import_actual(name, globals, locals, fromlist, level)
-        finally:
-            if not cached:
-                end = time.time()
-                self._logger.debug("Imported %s", import_mod)
-                imp_obj.end_time = end
 
 
 def setup_logging() -> None:
@@ -225,17 +243,18 @@ def setup_logging() -> None:
                 record.levelname = "CRIT"
             return super().format(record)
 
-    sh = logging.StreamHandler()
-    fh = logging.FileHandler(LOG_FILE)
     formatter = ShortLevelNameFormatter(
         style="{",
         fmt="{asctime} {levelname:>5s} [{name:<13s}] - {message}",
     )
-    sh.setFormatter(formatter)
-    fh.setFormatter(formatter)
-    logger.addHandler(sh)
-    logger.addHandler(fh)
     logger.setLevel(logging.DEBUG)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(formatter)
+    logger.addHandler(sh)
+    # fh = logging.FileHandler(LOG_FILE)
+    # fh.setFormatter(formatter)
+    # logger.addHandler(fh)
 
 
 def parse_args(argv: list[str] | None = None):
